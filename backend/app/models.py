@@ -188,7 +188,11 @@ class QualityGateRule:
 
 @dataclass
 class SnapshotPartition:
-    """分区快照：按日分区快照管理与版本标记。"""
+    """分区快照：按日分区快照管理与版本标记。
+
+    归属信息与分区内行键保存在快照上；每次归属确认/移交都会追加一条
+    OwnershipRecord，快照只暴露当前归属，历史范围由归属凭据回查。
+    """
     partition_id: int
     partition_code: str
     target_wide_table: str
@@ -198,6 +202,9 @@ class SnapshotPartition:
     status_mark: str
     dependency_partitions: list[str]
     created_time: str
+    owner_party: str = ""
+    row_keys: list[str] = field(default_factory=list)
+    ownership_history: list["OwnershipRecord"] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -209,6 +216,111 @@ class SnapshotPartition:
             "状态标记": self.status_mark,
             "依赖分区": ",".join(self.dependency_partitions),
             "创建时间": self.created_time,
+        }
+
+    def effective_owner(self, at_time: str = "") -> str:
+        """返回指定时刻的实际归属方；不传时刻则返回当前归属方。"""
+        current = self.owner_party
+        for record in self.ownership_history:
+            if not at_time or record.confirmed_at <= at_time:
+                current = record.owner_party
+        return current
+
+
+@dataclass
+class OwnershipRecord:
+    """分区归属确认记录：保留每次确认/移交的实际归属范围。"""
+    record_id: int
+    record_code: str
+    partition_id: int
+    partition_code: str
+    target_wide_table: str
+    owner_party: str
+    previous_owner: str
+    transfer_kind: str  # 初始确认 / 归属移交
+    row_keys: list[str]
+    confirmed_at: str
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "归属记录编号": self.record_code,
+            "分区编号": self.partition_code,
+            "目标宽表": self.target_wide_table,
+            "归属方": self.owner_party,
+            "原归属方": self.previous_owner,
+            "确认类型": self.transfer_kind,
+            "归属行范围": ",".join(self.row_keys),
+            "确认时间": self.confirmed_at,
+        }
+
+
+@dataclass
+class AccessCredential:
+    """取数凭据：归属方对特定宽表+分区的行范围取数资格。"""
+    credential_id: int
+    credential_code: str
+    owner_party: str
+    target_wide_table: str
+    partition_id: int
+    partition_code: str
+    row_keys: list[str]
+    granted_at: str
+    valid_until: str
+    credential_status: str = "有效"  # 有效 / 已作废
+    revoked_at: str = ""
+    revoke_reason: str = ""
+
+    def is_active(self, at_time: str = "") -> bool:
+        if self.credential_status != "有效":
+            return False
+        return bool(not at_time or at_time <= self.valid_until)
+
+    def covers(self, target_wide_table: str, partition_id: int,
+                row_keys: list[str]) -> bool:
+        """单次交付的行必须全部落在同一张凭据覆盖的宽表/分区/行范围内。"""
+        if self.target_wide_table != target_wide_table:
+            return False
+        if self.partition_id != partition_id:
+            return False
+        scope = set(self.row_keys)
+        return all(key in scope for key in row_keys)
+
+
+@dataclass
+class ExportApplication:
+    """快照导出申请：按申请识别的取数申请、发放与下载重试。"""
+    application_id: int
+    application_code: str
+    applicant_party: str
+    target_wide_table: str
+    plan_id: int
+    plan_code: str
+    partition_id: int
+    partition_code: str
+    credential_id: int
+    credential_code: str
+    prepared_row_keys: list[str]
+    accepted_at: str
+    application_status: str = "已受理"  # 已受理 / 已发放 / 已阻断
+    delivered_row_keys: list[str] = field(default_factory=list)
+    delivered_at: str = ""
+    block_reason: str = ""
+    download_token: str = ""
+    download_attempts: int = 0
+    last_download_at: str = ""
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "申请编号": self.application_code,
+            "申请方": self.applicant_party,
+            "目标宽表": self.target_wide_table,
+            "计划编号": self.plan_code,
+            "分区编号": self.partition_code,
+            "取数凭据": self.credential_code,
+            "申请状态": self.application_status,
+            "备妥行数": str(len(self.prepared_row_keys)),
+            "已发放行数": str(len(self.delivered_row_keys)),
+            "阻断原因": self.block_reason,
         }
 
 

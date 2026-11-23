@@ -11,16 +11,19 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.models import (
+    AccessCredential,
     BackfillTask,
     ColdStoreStrategy,
     CrossValidatePlan,
     DataDriftRecord,
+    ExportApplication,
     ExportPlan,
     FusionJob,
     FusionMonitorMetric,
     LineageEdge,
     MergeConflictRule,
     MetricAggrRule,
+    OwnershipRecord,
     PartitionRule,
     QualityGateRule,
     SchemaMapping,
@@ -60,6 +63,9 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        self._ownership_records: dict[int, OwnershipRecord] = {}
+        self._credentials: dict[int, AccessCredential] = {}
+        self._export_applications: dict[int, ExportApplication] = {}
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -161,7 +167,9 @@ class FusionEngine:
 
     def create_snapshot(self, target_wide_table: str, partition_key_value: str,
                         dependency_partitions: list[str] | None = None,
-                        schema_digest: str = "") -> SnapshotPartition:
+                        schema_digest: str = "",
+                        owner_party: str = "",
+                        row_keys: list[str] | None = None) -> SnapshotPartition:
         sid = self._next_seq()
         snap = SnapshotPartition(
             partition_id=sid,
@@ -173,9 +181,524 @@ class FusionEngine:
             status_mark="创建中",
             dependency_partitions=dependency_partitions or [],
             created_time=_now_iso(),
+            owner_party=owner_party,
+            row_keys=list(row_keys or []),
         )
         self._snapshots[sid] = snap
         return snap
+
+    def stage_partition_rows(self, snapshot_id: int,
+                             rows: list[dict[str, Any]],
+                             key_field: str = "id") -> dict[str, Any]:
+        """把明细行备入分区快照，登记行键与行数，作为后续归属与取数核对范围。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+        snap.row_keys = [str(row.get(key_field, "")) for row in rows]
+        snap.record_count = len(rows)
+        return {
+            "ok": True,
+            "partition_code": snap.partition_code,
+            "row_keys": list(snap.row_keys),
+            "record_count": snap.record_count,
+        }
+
+    # ---- 7b. 分区归属确认与移交 ----
+
+    def confirm_partition_ownership(self, snapshot_id: int,
+                                    owner_party: str) -> dict[str, Any]:
+        """确认分区的初始归属，并保留该次确认的实际归属范围。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+        if not owner_party.strip():
+            return {"ok": False, "message": "归属方不能为空"}
+        if snap.owner_party:
+            return {
+                "ok": False,
+                "message": (
+                    f"分区 {snap.partition_code} 已归属 {snap.owner_party}，"
+                    "初始确认只能执行一次，更换归属请走归属移交"
+                ),
+            }
+        return self._append_ownership(
+            snap, owner_party, previous_owner="", transfer_kind="初始确认",
+        )
+
+    def transfer_partition_ownership(self, snapshot_id: int,
+                                     from_party: str,
+                                     to_party: str) -> dict[str, Any]:
+        """合法移交分区归属：校验原归属方后追加新的归属确认记录。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+        if not snap.owner_party:
+            return {
+                "ok": False,
+                "message": f"分区 {snap.partition_code} 尚未确认初始归属，不能移交",
+            }
+        if snap.owner_party != from_party:
+            return {
+                "ok": False,
+                "message": (
+                    f"移交失败：分区 {snap.partition_code} 当前归属 {snap.owner_party}，"
+                    f"与申请移交方 {from_party} 不一致"
+                ),
+            }
+        if not to_party.strip():
+            return {"ok": False, "message": "接手方不能为空"}
+        if to_party == from_party:
+            return {"ok": False, "message": "接手方与原归属方相同，无需移交"}
+        return self._append_ownership(
+            snap, to_party, previous_owner=from_party, transfer_kind="归属移交",
+        )
+
+    def _append_ownership(self, snap: SnapshotPartition, owner_party: str,
+                          previous_owner: str, transfer_kind: str) -> dict[str, Any]:
+        sid = self._next_seq()
+        record = OwnershipRecord(
+            record_id=sid,
+            record_code=_generate_code("OWNR", sid),
+            partition_id=snap.partition_id,
+            partition_code=snap.partition_code,
+            target_wide_table=snap.target_wide_table,
+            owner_party=owner_party,
+            previous_owner=previous_owner,
+            transfer_kind=transfer_kind,
+            row_keys=list(snap.row_keys),
+            confirmed_at=_now_iso(),
+        )
+        snap.ownership_history.append(record)
+        snap.owner_party = owner_party
+        self._ownership_records[sid] = record
+        return {
+            "ok": True,
+            "ownership_code": record.record_code,
+            "partition_code": snap.partition_code,
+            "owner_party": owner_party,
+            "previous_owner": previous_owner,
+            "transfer_kind": transfer_kind,
+            "row_keys": list(record.row_keys),
+            "confirmed_at": record.confirmed_at,
+        }
+
+    def get_ownership_history(self, snapshot_id: int) -> list[dict[str, Any]]:
+        """回查分区每次确认的实际归属范围（含移交前后的行范围）。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return []
+        return [
+            {
+                "ownership_code": record.record_code,
+                "partition_code": record.partition_code,
+                "target_wide_table": record.target_wide_table,
+                "owner_party": record.owner_party,
+                "previous_owner": record.previous_owner,
+                "transfer_kind": record.transfer_kind,
+                "row_keys": list(record.row_keys),
+                "confirmed_at": record.confirmed_at,
+            }
+            for record in snap.ownership_history
+        ]
+
+    def owner_at_time(self, snapshot_id: int, at_time: str) -> str:
+        """回查指定时刻分区的归属方，用于判断已受理申请当时的资格。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return ""
+        owner = ""
+        for record in snap.ownership_history:
+            if record.confirmed_at <= at_time:
+                owner = record.owner_party
+        return owner
+
+    # ---- 7c. 取数凭据（取数资格） ----
+
+    def issue_access_credential(self, snapshot_id: int, owner_party: str,
+                                valid_until: str = "2999-12-31T23:59:59+00:00"
+                                ) -> dict[str, Any]:
+        """按当前归属为归属方核发覆盖分区实际行范围的取数凭据。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+        if not snap.owner_party:
+            return {
+                "ok": False,
+                "message": f"分区 {snap.partition_code} 尚未确认归属，无法核发取数凭据",
+            }
+        if snap.owner_party != owner_party:
+            return {
+                "ok": False,
+                "message": (
+                    f"核发被拒：{owner_party} 不是分区 {snap.partition_code} 的当前归属方"
+                    f"（当前归属 {snap.owner_party}），旧归属方不能新申请"
+                ),
+            }
+        sid = self._next_seq()
+        credential = AccessCredential(
+            credential_id=sid,
+            credential_code=_generate_code("CRED", sid),
+            owner_party=owner_party,
+            target_wide_table=snap.target_wide_table,
+            partition_id=snap.partition_id,
+            partition_code=snap.partition_code,
+            row_keys=list(snap.row_keys),
+            granted_at=_now_iso(),
+            valid_until=valid_until,
+        )
+        self._credentials[sid] = credential
+        return {
+            "ok": True,
+            "credential_id": credential.credential_id,
+            "credential_code": credential.credential_code,
+            "owner_party": credential.owner_party,
+            "target_wide_table": credential.target_wide_table,
+            "partition_code": credential.partition_code,
+            "row_keys": list(credential.row_keys),
+            "valid_until": credential.valid_until,
+            "credential_status": credential.credential_status,
+        }
+
+    def revoke_access_credential(self, credential_id: int,
+                                 reason: str = "凭据作废") -> dict[str, Any]:
+        """单独作废一张取数凭据；已发放下载的重试将因此被阻断。"""
+        credential = self._credentials.get(credential_id)
+        if credential is None:
+            return {"ok": False, "message": f"取数凭据 {credential_id} 不存在"}
+        if credential.credential_status != "有效":
+            return {
+                "ok": False,
+                "message": f"取数凭据 {credential.credential_code} 已处于{credential.credential_status}状态",
+            }
+        credential.credential_status = "已作废"
+        credential.revoked_at = _now_iso()
+        credential.revoke_reason = reason
+        return {
+            "ok": True,
+            "credential_code": credential.credential_code,
+            "credential_status": credential.credential_status,
+            "revoked_at": credential.revoked_at,
+            "reason": reason,
+        }
+
+    # ---- 7d. 快照导出申请、发放与下载重试 ----
+
+    def accept_export_application(self, export_plan_id: int, snapshot_id: int,
+                                  applicant_party: str,
+                                  credential_id: int) -> dict[str, Any]:
+        """受理导出申请：校验分区归属、宽表一致性与取数凭据后备妥明细行。"""
+        plan = self._exports.get(export_plan_id)
+        snap = self._snapshots.get(snapshot_id)
+        if plan is None:
+            return {"ok": False, "message": f"导出计划 {export_plan_id} 不存在"}
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+
+        # 修复越权入口：分区必须属于申请注明的宽表，拒绝另一张宽表的分区编号。
+        if snap.target_wide_table != plan.target_wide_table:
+            return {
+                "ok": False,
+                "code": "PARTITION_TABLE_MISMATCH",
+                "message": (
+                    f"分区归属校验失败：分区 {snap.partition_code} 归属宽表 "
+                    f"{snap.target_wide_table}，与导出计划 {plan.plan_code} 注明的 "
+                    f"{plan.target_wide_table} 不一致，拒绝跨表取数"
+                ),
+            }
+
+        if not snap.owner_party:
+            return {
+                "ok": False,
+                "code": "OWNERSHIP_UNCONFIRMED",
+                "message": f"分区 {snap.partition_code} 尚未确认归属，不能受理导出申请",
+            }
+        if snap.owner_party != applicant_party:
+            return {
+                "ok": False,
+                "code": "OWNER_MISMATCH",
+                "message": (
+                    f"取数权限校验失败：{applicant_party} 不是分区 {snap.partition_code} "
+                    f"的当前归属方（当前归属 {snap.owner_party}）"
+                ),
+            }
+
+        credential = self._credentials.get(credential_id)
+        if credential is None:
+            return {"ok": False, "code": "CREDENTIAL_NOT_FOUND",
+                    "message": f"取数凭据 {credential_id} 不存在"}
+        if credential.credential_status != "有效":
+            return {
+                "ok": False, "code": "CREDENTIAL_REVOKED",
+                "message": f"取数凭据 {credential.credential_code} 已作废，不能受理新申请",
+            }
+        if credential.owner_party != applicant_party:
+            return {
+                "ok": False, "code": "CREDENTIAL_PARTY_MISMATCH",
+                "message": (
+                    f"取数凭据 {credential.credential_code} 归属 {credential.owner_party}，"
+                    f"与申请方 {applicant_party} 不一致"
+                ),
+            }
+        if credential.target_wide_table != snap.target_wide_table \
+                or credential.partition_id != snap.partition_id:
+            return {
+                "ok": False, "code": "CREDENTIAL_SCOPE_MISMATCH",
+                "message": (
+                    f"取数凭据 {credential.credential_code} 的覆盖范围 "
+                    f"{credential.target_wide_table}/{credential.partition_code} "
+                    f"与申请分区 {snap.target_wide_table}/{snap.partition_code} 不一致"
+                ),
+            }
+
+        prepared_row_keys = self._partition_row_keys(snap)
+        if not credential.covers(snap.target_wide_table, snap.partition_id,
+                                 prepared_row_keys):
+            return {
+                "ok": False, "code": "CREDENTIAL_SCOPE_MISMATCH",
+                "message": (
+                    f"取数凭据 {credential.credential_code} 无法覆盖分区 "
+                    f"{snap.partition_code} 的全部备妥行，受理被拒"
+                ),
+            }
+
+        sid = self._next_seq()
+        application = ExportApplication(
+            application_id=sid,
+            application_code=_generate_code("EXPA", sid),
+            applicant_party=applicant_party,
+            target_wide_table=plan.target_wide_table,
+            plan_id=plan.plan_id,
+            plan_code=plan.plan_code,
+            partition_id=snap.partition_id,
+            partition_code=snap.partition_code,
+            credential_id=credential.credential_id,
+            credential_code=credential.credential_code,
+            prepared_row_keys=list(prepared_row_keys),
+            accepted_at=_now_iso(),
+        )
+        self._export_applications[sid] = application
+        plan.export_status = "导出中"
+        return {
+            "ok": True,
+            "application_id": application.application_id,
+            "application_code": application.application_code,
+            "plan_code": plan.plan_code,
+            "partition_code": snap.partition_code,
+            "target_wide_table": plan.target_wide_table,
+            "credential_code": credential.credential_code,
+            "prepared_row_keys": list(prepared_row_keys),
+            "prepared_rows": len(prepared_row_keys),
+            "accepted_at": application.accepted_at,
+        }
+
+    def deliver_export_application(self, application_id: int) -> dict[str, Any]:
+        """发放检查：用分区归属凭据核对可交付行，处理受理后的归属移交冲突。"""
+        application = self._export_applications.get(application_id)
+        if application is None:
+            return {"ok": False, "message": f"导出申请 {application_id} 不存在"}
+        if application.application_status == "已发放":
+            return {
+                "ok": False, "code": "ALREADY_DELIVERED",
+                "message": f"申请 {application.application_code} 已发放，请走下载重试",
+            }
+
+        snap = self._snapshots.get(application.partition_id)
+        plan = self._exports.get(application.plan_id)
+        credential = self._credentials.get(application.credential_id)
+        if snap is None or plan is None or credential is None:
+            return self._block_application(
+                application, "申请关联的分区/计划/凭据已缺失，发放被阻断")
+
+        block = self._check_delivery_eligibility(application, snap, plan, credential)
+        if block is not None:
+            return self._block_application(application, block)
+
+        records = self._collect_partition_records(snap, application.prepared_row_keys)
+        application.delivered_row_keys = list(application.prepared_row_keys)
+        application.application_status = "已发放"
+        application.delivered_at = _now_iso()
+        application.download_token = (
+            f"DL-{application.application_code}-{uuid.uuid4().hex[:10]}"
+        )
+        application.download_attempts = 1
+        application.last_download_at = application.delivered_at
+        plan.export_status = "已完成"
+
+        return {
+            "ok": True,
+            "application_code": application.application_code,
+            "plan_code": plan.plan_code,
+            "target_wide_table": plan.target_wide_table,
+            "partition_code": snap.partition_code,
+            "credential_code": credential.credential_code,
+            "owner_at_acceptance": self.owner_at_time(snap.partition_id,
+                                                      application.accepted_at),
+            "current_owner": snap.owner_party,
+            "ownership_transferred": (
+                self.owner_at_time(snap.partition_id, application.accepted_at)
+                != snap.owner_party
+            ),
+            "delivered_row_keys": list(application.delivered_row_keys),
+            "exported_rows": len(records),
+            "download_token": application.download_token,
+            "records": records,
+        }
+
+    def retry_export_download(self, application_id: int) -> dict[str, Any]:
+        """已交付下载按申请重试：只能用受理时核准的同一凭据，禁止用新资格重签。"""
+        application = self._export_applications.get(application_id)
+        if application is None:
+            return {"ok": False, "message": f"导出申请 {application_id} 不存在"}
+        if application.application_status != "已发放":
+            return {
+                "ok": False, "code": "NOT_DELIVERED",
+                "message": (
+                    f"申请 {application.application_code} 状态为{application.application_status}，"
+                    "尚无已交付下载可重试"
+                ),
+            }
+
+        snap = self._snapshots.get(application.partition_id)
+        plan = self._exports.get(application.plan_id)
+        credential = self._credentials.get(application.credential_id)
+        if snap is None or plan is None or credential is None:
+            return {
+                "ok": False, "code": "DOWNLOAD_BLOCKED",
+                "message": "申请关联的分区/计划/凭据已缺失，下载重试被阻断",
+            }
+
+        block = self._check_delivery_eligibility(application, snap, plan, credential)
+        if block is not None:
+            return {
+                "ok": False,
+                "code": "DOWNLOAD_BLOCKED",
+                "message": block,
+                "application_code": application.application_code,
+                "credential_code": credential.credential_code,
+                "credential_status": credential.credential_status,
+            }
+
+        application.download_attempts += 1
+        application.last_download_at = _now_iso()
+        records = self._collect_partition_records(snap, application.delivered_row_keys)
+        return {
+            "ok": True,
+            "application_code": application.application_code,
+            "plan_code": plan.plan_code,
+            "download_token": application.download_token,
+            "download_attempts": application.download_attempts,
+            "credential_code": credential.credential_code,
+            "delivered_row_keys": list(application.delivered_row_keys),
+            "exported_rows": len(records),
+            "records": records,
+        }
+
+    def get_export_application(self, application_id: int) -> dict[str, Any] | None:
+        """回查申请当时的资格与移交是否影响本次发放。"""
+        application = self._export_applications.get(application_id)
+        if application is None:
+            return None
+        owner_at_acceptance = self.owner_at_time(
+            application.partition_id, application.accepted_at)
+        snap = self._snapshots.get(application.partition_id)
+        current_owner = snap.owner_party if snap else ""
+        credential = self._credentials.get(application.credential_id)
+        return {
+            "application_code": application.application_code,
+            "applicant_party": application.applicant_party,
+            "target_wide_table": application.target_wide_table,
+            "plan_code": application.plan_code,
+            "partition_code": application.partition_code,
+            "credential_code": application.credential_code,
+            "credential_status": credential.credential_status if credential else "缺失",
+            "application_status": application.application_status,
+            "prepared_row_keys": list(application.prepared_row_keys),
+            "delivered_row_keys": list(application.delivered_row_keys),
+            "block_reason": application.block_reason,
+            "accepted_at": application.accepted_at,
+            "delivered_at": application.delivered_at,
+            "owner_at_acceptance": owner_at_acceptance,
+            "current_owner": current_owner,
+            "ownership_transferred_after_acceptance": (
+                owner_at_acceptance != current_owner
+            ),
+            "qualified_at_acceptance": owner_at_acceptance == application.applicant_party,
+            "download_token": application.download_token,
+            "download_attempts": application.download_attempts,
+        }
+
+    def _check_delivery_eligibility(self, application: ExportApplication,
+                                    snap: SnapshotPartition, plan: ExportPlan,
+                                    credential: AccessCredential) -> str | None:
+        """统一的发放/下载资格检查，返回 None 表示可交付，否则为阻断原因。"""
+        if snap.target_wide_table != plan.target_wide_table \
+                or snap.target_wide_table != application.target_wide_table:
+            return (
+                f"分区 {snap.partition_code} 归属宽表 {snap.target_wide_table} 与申请注明的 "
+                f"{application.target_wide_table} 不一致，禁止跨表取数"
+            )
+        if credential.credential_status != "有效":
+            return (
+                f"取数凭据 {credential.credential_code} 已作废"
+                f"（{credential.revoke_reason or '未注明原因'}），原方下载被阻断"
+            )
+        if not credential.is_active():
+            return f"取数凭据 {credential.credential_code} 已过有效期"
+        if credential.owner_party != application.applicant_party:
+            return (
+                f"取数凭据 {credential.credential_code} 归属 {credential.owner_party}，"
+                f"不能用于申请方 {application.applicant_party} 的下载"
+            )
+        row_keys = (
+            application.delivered_row_keys
+            if application.application_status == "已发放"
+            else application.prepared_row_keys
+        )
+        # 单次交付的行必须由同一次有效的取数资格完整覆盖。
+        if not credential.covers(snap.target_wide_table, snap.partition_id, row_keys):
+            return (
+                f"取数凭据 {credential.credential_code} 无法覆盖本次交付的全部行，"
+                "单次交付必须由同一次有效取数资格覆盖"
+            )
+        return None
+
+    def _block_application(self, application: ExportApplication,
+                           reason: str) -> dict[str, Any]:
+        application.application_status = "已阻断"
+        application.block_reason = reason
+        plan = self._exports.get(application.plan_id)
+        if plan is not None:
+            plan.export_status = "导出失败"
+        return {
+            "ok": False,
+            "code": "DELIVERY_BLOCKED",
+            "message": reason,
+            "application_code": application.application_code,
+            "block_reason": reason,
+            "pending_row_keys": list(application.prepared_row_keys),
+            "pending_rows": len(application.prepared_row_keys),
+        }
+
+    def _partition_row_keys(self, snap: SnapshotPartition) -> list[str]:
+        if snap.row_keys:
+            return list(snap.row_keys)
+        fusion_job = self._find_fusion_job_by_table(snap.target_wide_table)
+        if fusion_job is None:
+            return []
+        return [str(rec.get("id", "")) for rec in fusion_job.merged_records]
+
+    def _collect_partition_records(self, snap: SnapshotPartition,
+                                   row_keys: list[str]) -> list[dict[str, Any]]:
+        fusion_job = self._find_fusion_job_by_table(snap.target_wide_table)
+        if fusion_job is None:
+            return []
+        wanted = set(row_keys)
+        records = [
+            dict(rec) for rec in fusion_job.merged_records
+            if str(rec.get("id", "")) in wanted
+        ]
+        records.sort(key=lambda rec: str(rec.get("id", "")))
+        return records
 
     # ---- 3. fusion_job -> watermark_track -> delta_merge ----
 
@@ -541,13 +1064,27 @@ class FusionEngine:
 
     def execute_export_from_snapshot(self, export_id: int,
                                      snapshot_id: int) -> dict[str, Any]:
-        """从分区快照执行数据导出。"""
+        """从分区快照执行数据导出。
+
+        修复越权取数：分区编号必须归属导出计划注明的同一张宽表，
+        禁止拿另一张宽表的分区编号导出无关表的交易。
+        """
         plan = self._exports.get(export_id)
         snap = self._snapshots.get(snapshot_id)
         if plan is None:
             return {"ok": False, "message": f"导出计划 {export_id} 不存在"}
         if snap is None:
             return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+        if snap.target_wide_table != plan.target_wide_table:
+            return {
+                "ok": False,
+                "code": "PARTITION_TABLE_MISMATCH",
+                "message": (
+                    f"分区归属校验失败：分区 {snap.partition_code} 归属宽表 "
+                    f"{snap.target_wide_table}，与导出计划 {plan.plan_code} 注明的 "
+                    f"{plan.target_wide_table} 不一致，拒绝跨表取数"
+                ),
+            }
 
         fusion_job = self._find_fusion_job_by_table(snap.target_wide_table)
         records = fusion_job.merged_records if fusion_job else []
@@ -567,6 +1104,7 @@ class FusionEngine:
             "ok": True,
             "plan_code": plan.plan_code,
             "snapshot_code": snap.partition_code,
+            "target_wide_table": plan.target_wide_table,
             "exported_rows": len(records),
             "format": plan.export_format,
             "path": plan.export_path,
@@ -874,6 +1412,9 @@ class FusionEngine:
             "cross_validates": len(self._cross_validates),
             "drifts": len(self._drifts),
             "monitors": len(self._monitors),
+            "ownership_records": len(self._ownership_records),
+            "access_credentials": len(self._credentials),
+            "export_applications": len(self._export_applications),
         }
 
 
